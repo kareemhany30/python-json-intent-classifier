@@ -14,10 +14,10 @@ from typing import Any
 
 PROMPT_VERSION = "project-intent-v1"
 SCHEMA_VERSION = "1.0"
-DEFAULT_MODEL = "gpt-6-luna"
+DEFAULT_MODEL = "gemini-3.1-flash-lite"
 DEFAULT_TIMEOUT_SECONDS = 20
-INPUT_USD_PER_MILLION = 0.05
-OUTPUT_USD_PER_MILLION = 0.25
+INPUT_USD_PER_MILLION = 0.25
+OUTPUT_USD_PER_MILLION = 1.50
 
 SYNTHETIC_REQUEST = (
     "Please prepare a one-page project plan for a fictional community garden. "
@@ -107,21 +107,6 @@ def estimate_cost(usage: dict[str, int] | None) -> float | None:
     )
 
 
-def _extract_text(response: dict[str, Any]) -> str:
-    if isinstance(response.get("output_text"), str):
-        return response["output_text"]
-    chunks: list[str] = []
-    for item in response.get("output", []):
-        for content in item.get("content", []):
-            if content.get("type") == "output_text" and isinstance(content.get("text"), str):
-                chunks.append(content["text"])
-            if content.get("type") == "refusal":
-                raise ProviderError("provider refused the request")
-    if not chunks:
-        raise InvalidOutput("provider returned no JSON text")
-    return "".join(chunks)
-
-
 def classify_request(
     request: str = SYNTHETIC_REQUEST,
     *,
@@ -129,30 +114,29 @@ def classify_request(
     model: str | None = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> Result:
-    key = api_key or os.getenv("OPENAI_API_KEY")
+    key = api_key or os.getenv("GEMINI_API_KEY")
     if not key:
-        raise ProviderError("OPENAI_API_KEY is not set; use --demo or configure the environment")
-    model_id = model or os.getenv("OPENAI_MODEL", DEFAULT_MODEL)
+        raise ProviderError("GEMINI_API_KEY is not set; use --demo or configure the environment")
+    model_id = model or os.getenv("GEMINI_MODEL", DEFAULT_MODEL)
+    # Gemini's constrained schema subset does not accept additionalProperties;
+    # local validation below still rejects unexpected fields in the response.
+    gemini_schema = dict(INTENT_SCHEMA)
+    gemini_schema.pop("additionalProperties", None)
     payload = {
-        "model": model_id,
-        "input": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": request},
+        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [
+            {"role": "user", "parts": [{"text": request}]},
         ],
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "project_intent",
-                "strict": True,
-                "schema": INTENT_SCHEMA,
-            }
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": gemini_schema,
         },
-        "store": False,
     }
+    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
     req = urllib.request.Request(
-        "https://api.openai.com/v1/responses",
+        endpoint,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        headers={"x-goog-api-key": key, "Content-Type": "application/json"},
         method="POST",
     )
     started = time.monotonic()
@@ -161,8 +145,15 @@ def classify_request(
             body = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         # HTTPError is also a URLError, so handle it first to preserve status codes.
-        # Avoid printing provider response bodies which may contain request details.
-        raise ProviderError(f"provider returned HTTP {exc.code}") from exc
+        # Gemini's error envelope helps diagnose invalid requests; never print headers.
+        try:
+            error_body = json.loads(exc.read().decode("utf-8"))
+            detail = error_body.get("error", {}).get("message", "")
+        except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+            detail = ""
+        detail = " ".join(str(detail).split())[:500]
+        suffix = f": {detail}" if detail else ""
+        raise ProviderError(f"Gemini returned HTTP {exc.code}{suffix}") from exc
     except (TimeoutError, urllib.error.URLError) as exc:
         if isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None), TimeoutError):
             raise RequestTimeout(f"provider timed out after {timeout:g}s") from exc
@@ -174,16 +165,24 @@ def classify_request(
         raise InvalidOutput("provider returned a malformed response envelope") from exc
 
     duration = time.monotonic() - started
-    intent = validate_intent(_extract_text(body))
-    raw_usage = body.get("usage")
+    try:
+        text = body["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError, TypeError) as exc:
+        prompt_feedback = body.get("promptFeedback", {})
+        if prompt_feedback.get("blockReason"):
+            raise ProviderError("Gemini blocked the request") from exc
+        raise InvalidOutput("Gemini returned no JSON text") from exc
+    intent = validate_intent(text)
+    raw_usage = body.get("usageMetadata")
     usage = None
     if isinstance(raw_usage, dict):
-        usage = {
-            "input_tokens": raw_usage["input_tokens"],
-            "output_tokens": raw_usage["output_tokens"],
-        }
-        if isinstance(raw_usage.get("input_tokens_details"), dict):
-            usage["cached_input_tokens"] = raw_usage["input_tokens_details"].get("cached_tokens", 0)
+        if "promptTokenCount" in raw_usage and "candidatesTokenCount" in raw_usage:
+            usage = {
+                "input_tokens": raw_usage["promptTokenCount"],
+                "output_tokens": raw_usage["candidatesTokenCount"],
+            }
+            if "cachedContentTokenCount" in raw_usage:
+                usage["cached_input_tokens"] = raw_usage["cachedContentTokenCount"]
     return Result(intent, model_id, PROMPT_VERSION, round(duration, 3), usage, estimate_cost(usage))
 
 #this is the local demo result
