@@ -53,7 +53,6 @@ INTENT_SCHEMA: dict[str, Any] = {
         "deliverables",
         "constraints",
     ],
-    "additionalProperties": False,
 }
 
 
@@ -129,14 +128,6 @@ def estimate_cost(usage: dict[str, int] | None) -> float | None:
     return round(input_cost + output_cost, 10)
 
 
-def _get_gemini_schema() -> dict[str, Any]:
-    """Return the provider-compatible schema; local validation stays stricter."""
-    schema = dict(INTENT_SCHEMA)
-    # Gemini does not accept this keyword, so validate extra fields locally instead.
-    schema.pop("additionalProperties", None)
-    return schema
-
-
 def _build_request(request_text: str, api_key: str, model_id: str) -> urllib.request.Request:
     """Create the HTTPS request Gemini's generateContent endpoint expects."""
     endpoint = (
@@ -148,7 +139,7 @@ def _build_request(request_text: str, api_key: str, model_id: str) -> urllib.req
         "contents": [{"role": "user", "parts": [{"text": request_text}]}],
         "generationConfig": {
             "responseMimeType": "application/json",
-            "responseSchema": _get_gemini_schema(),
+            "responseSchema": INTENT_SCHEMA,
         },
     }
 
