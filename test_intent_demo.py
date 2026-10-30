@@ -1,8 +1,9 @@
+"""Tests for local JSON intent validation."""
+
 import json
 import unittest
 
 from intent_demo import InvalidOutput, SCHEMA_VERSION, validate_intent
-##this is just a testing file 
 
 VALID = {
     "schema_version": SCHEMA_VERSION,
